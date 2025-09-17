@@ -33,3 +33,7 @@
 *.out
 *.app
 .vscode/c_cpp_properties.json
+.pio/build/lolin_s2_mini/.sconsign311.dblite
+.pio/build/lolin_s2_mini/firmware.bin
+.pio/build/lolin_s2_mini/firmware.elf
+.pio/build/lolin_s2_mini/firmware.map

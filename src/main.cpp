@@ -74,8 +74,7 @@ struct SystemState
     String status;
     uint32_t lastSuccessfulTempRead;
     bool temperatureSensorFault;
-    bool pidAActive;
-    bool pidBActive;
+    bool ledOverride; // Флаг приоритета аварийного режима
 };
 
 struct SystemDiagnostics
@@ -86,13 +85,14 @@ struct SystemDiagnostics
     uint32_t tempReadErrors;
     uint32_t pidCalculations;
     uint32_t pidCalculationFailures;
+    uint32_t pidCalculationTimeSpikes;
     String lastResetReason;
     String lastError;
     uint32_t freeHeap;
 };
 
-SystemState state = {0.0, 22.0, 22.0, 0.0, 0.0, true, false, "INIT", 0, false};
-SystemDiagnostics diagnostics = {0, 0, 0, 0, 0, 0, "", "", 0};
+SystemState state = {0.0, 22.0, 22.0, 0.0, 0.0, true, false, "INIT", 0, false, false};
+SystemDiagnostics diagnostics = {0, 0, 0, 0, 0, 0, 0, "", "", 0};
 
 // === СИНХРОНИЗАЦИЯ ===
 SemaphoreHandle_t xMutexState;
@@ -127,8 +127,8 @@ PID myPID_A(&state.currentTemp, &state.OutputA, &state.SetpointA, Kp, Ki, Kd, DI
 PID myPID_B(&state.currentTemp, &state.OutputB, &state.SetpointB, Kp, Ki, Kd, DIRECT);
 
 // === OTA ===
-const char *OTA_PASSWORD = "your_ota_password_123";
 String otaHostname = "wemos-s2-heating";
+String otaPassword = "default_ota_password"; // Временное значение
 
 // === ФУНКЦИИ ===
 void setupPWM();
@@ -221,6 +221,51 @@ void savePIDParams()
     Serial.println("💾 Параметры ПИД сохранены в SPIFFS");
 }
 
+void loadOTAPassword()
+{
+    if (!SPIFFS.exists("/ota_password.txt"))
+    {
+        // Генерируем случайный пароль 16 символов
+        const char *chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        String newPassword = "";
+        for (int i = 0; i < 16; i++)
+        {
+            newPassword += chars[random(0, strlen(chars))];
+        }
+
+        // Сохраняем в SPIFFS
+        File file = SPIFFS.open("/ota_password.txt", "w");
+        if (file)
+        {
+            file.print(newPassword);
+            file.close();
+            Serial.println("🔑 Сгенерирован и сохранен новый OTA пароль");
+            otaPassword = newPassword;
+        }
+        else
+        {
+            Serial.println("❌ Не удалось создать файл с паролем OTA");
+            otaPassword = "default_fallback"; // Резервный пароль
+            return;
+        }
+    }
+
+    // Читаем пароль из файла
+    File file = SPIFFS.open("/ota_password.txt", "r");
+    if (file)
+    {
+        otaPassword = file.readString();
+        file.close();
+        otaPassword.trim(); // Удаляем лишние символы
+        Serial.println("🔑 OTA пароль загружен из SPIFFS");
+    }
+    else
+    {
+        Serial.println("❌ Не удалось прочитать пароль OTA");
+        otaPassword = "default_fallback";
+    }
+}
+
 float readTemperature()
 {
     for (int attempt = 0; attempt < TEMP_READ_RETRIES; attempt++)
@@ -262,7 +307,7 @@ void connectToWiFi()
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 15)
     {
-        delay(1000);
+        vTaskDelay(pdMS_TO_TICKS(1000));
         Serial.print(".");
         attempts++;
     }
@@ -305,6 +350,7 @@ void emergencyShutdown(String reason)
     state.OutputB = 0;
     state.temperatureSensorFault = true;
     state.status = "EMERGENCY: " + reason;
+    state.ledOverride = true; // Активируем приоритет аварийного режима
 
     if (reason.length() > 128)
     {
@@ -319,7 +365,6 @@ void emergencyShutdown(String reason)
 
     ledcWrite(PWM_CHANNEL_A, 0);
     ledcWrite(PWM_CHANNEL_B, 0);
-    digitalWrite(LED_PIN, HIGH); // Мигание при аварии
 
     Serial.println("🚨 АВАРИЙНОЕ ОТКЛЮЧЕНИЕ: " + reason);
     mqttClient.publish(TOPIC_EMERGENCY, reason.c_str(), true);
@@ -332,9 +377,16 @@ void resetEmergency()
     state.systemEnabled = true;
     state.status = "NORMAL";
     state.temperatureSensorFault = false;
+    state.ledOverride = false; // Отключаем приоритет аварийного режима
     xSemaphoreGive(xMutexState);
 
     Serial.println("🔄 Аварийное состояние сброшено");
+
+    if (mqttClient.connected())
+    {
+        mqttClient.publish(TOPIC_STATUS, "NORMAL", true);
+        mqttClient.publish(TOPIC_EMERGENCY, "RESET", true);
+    }
 }
 
 void publishStatus()
@@ -365,7 +417,7 @@ void publishDiagnostics()
 // ИСПРАВЛЕНО: Подавляем ложное предупреждение
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<1536> doc;
 #pragma GCC diagnostic pop
 
     xSemaphoreTake(xMutexState, portMAX_DELAY);
@@ -383,7 +435,7 @@ void publishDiagnostics()
     doc["last_reset_reason"] = diagnostics.lastResetReason.c_str();
     xSemaphoreGive(xMutexState);
 
-    char buffer[1024];
+    char buffer[1536];
     serializeJson(doc, buffer);
 
     if (mqttClient.connected())
@@ -546,7 +598,8 @@ void vTaskCalculatePID(void *pvParameters)
         if (state.systemEnabled && !state.emergencyStop && !state.temperatureSensorFault)
         {
             // Рассчитываем мощность для каждой зоны
-            bool computedA, computedB;
+            bool computedA = false;
+            bool computedB = false;
 
             // КРИТИЧЕСКИ ВАЖНО: Защищаем вызов Compute() той же секцией, что и изменение параметров
             portENTER_CRITICAL(&pidMux);
@@ -566,7 +619,7 @@ void vTaskCalculatePID(void *pvParameters)
                 portEXIT_CRITICAL(&pidMux);
             }
 
-            if (computedA || computedB)
+            else if (computedA || computedB)
             {
                 diagnostics.pidCalculations++;
 
@@ -604,6 +657,10 @@ void vTaskCalculatePID(void *pvParameters)
                 lastOutputB = state.OutputB;
 
                 state.status = "REGULATING";
+            }
+            else
+            {
+                diagnostics.pidCalculationFailures++;
             }
         }
         else
@@ -644,11 +701,13 @@ void vTaskControlPWM(void *pvParameters)
             // Контур A активен
             if (targetPWM_A > currentPWM_A)
             {
-                currentPWM_A = min(static_cast<uint8_t>(currentPWM_A + PWM_SMOOTHING_STEP), targetPWM_A);
+                currentPWM_A = constrain(min(static_cast<uint8_t>(currentPWM_A + PWM_SMOOTHING_STEP), targetPWM_A), 0, 255);
             }
             else if (targetPWM_A < currentPWM_A)
             {
-                currentPWM_A = max(static_cast<uint8_t>(currentPWM_A - PWM_SMOOTHING_STEP), targetPWM_A);
+                // ИСПРАВЛЕНО: Безопасное вычитание с использованием знакового типа
+                int newPWM = static_cast<int>(currentPWM_A) - PWM_SMOOTHING_STEP;
+                currentPWM_A = constrain(static_cast<uint8_t>(max(newPWM, static_cast<int>(targetPWM_A))), 0, 255);
             }
 
             // Физически отключаем контур B, но НЕ СБРАСЫВАЕМ его состояние
@@ -660,11 +719,13 @@ void vTaskControlPWM(void *pvParameters)
             // Контур B активен
             if (targetPWM_B > currentPWM_B)
             {
-                currentPWM_B = min(static_cast<uint8_t>(currentPWM_B + PWM_SMOOTHING_STEP), targetPWM_B);
+                currentPWM_B = constrain(min(static_cast<uint8_t>(currentPWM_B + PWM_SMOOTHING_STEP), targetPWM_B), 0, 255);
             }
             else if (targetPWM_B < currentPWM_B)
             {
-                currentPWM_B = max(static_cast<uint8_t>(currentPWM_B - PWM_SMOOTHING_STEP), targetPWM_B);
+                // ИСПРАВЛЕНО: Безопасное вычитание с использованием знакового типа
+                int newPWM = static_cast<int>(currentPWM_B) - PWM_SMOOTHING_STEP;
+                currentPWM_B = constrain(static_cast<uint8_t>(max(newPWM, static_cast<int>(targetPWM_B))), 0, 255);
             }
 
             // Физически отключаем контур A, но НЕ СБРАСЫВАЕМ его состояние
@@ -760,7 +821,7 @@ void vTaskMQTTClient(void *pvParameters)
 void vTaskOTA(void *pvParameters)
 {
     ArduinoOTA.setHostname(otaHostname.c_str());
-    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.setPassword(otaPassword.c_str());
     ArduinoOTA.onStart([]()
                        {
     String type;
@@ -800,7 +861,7 @@ void vTaskOTA(void *pvParameters)
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     Serial.println("\n\n=== 🚀 Wemos S2 Mini Термостат с двумя контурами ===");
     Serial.println("Версия: 9.0 (Интерлейвинг PWM, FreeRTOS, OTA)");
@@ -885,6 +946,11 @@ void setup()
 
 void setupOTA()
 {
+    loadOTAPassword(); // Загружаем пароль перед настройкой
+
+    ArduinoOTA.setHostname(otaHostname.c_str());
+    ArduinoOTA.setPassword(otaPassword.c_str());
+
     MDNS.begin(otaHostname.c_str());
     Serial.printf("🌐 OTA доступен по http://%s.local/update\n", otaHostname.c_str());
 }
@@ -922,13 +988,59 @@ void loop()
 {
     esp_task_wdt_reset();
 
-    // Мигание LED для индикации работы
+    // Централизованное управление светодиодом
+    bool isEmergency = false;
+    bool ledOverride = false;
+    String status = "";
+
+    xSemaphoreTake(xMutexState, portMAX_DELAY);
+    isEmergency = state.emergencyStop;
+    ledOverride = state.ledOverride;
+    status = state.status;
+    xSemaphoreGive(xMutexState);
+
     static uint32_t lastBlink = 0;
-    if (millis() - lastBlink > 1000)
+    static bool ledState = false;
+
+    if (ledOverride)
     {
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-        lastBlink = millis();
+        // Аварийный режим: быстрое мигание (250 мс)
+        if (millis() - lastBlink > 250)
+        {
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+            lastBlink = millis();
+        }
+    }
+    else
+    {
+        // Расширенная индикация состояния
+        if (status == "REGULATING")
+        {
+            // Медленное мигание при регулировании
+            if (millis() - lastBlink > 1000)
+            {
+                ledState = !ledState;
+                digitalWrite(LED_PIN, ledState);
+                lastBlink = millis();
+            }
+        }
+        else if (status == "STANDBY")
+        {
+            // Медленное мигание с паузой при простое
+            if (millis() - lastBlink > 1500)
+            {
+                ledState = !ledState;
+                digitalWrite(LED_PIN, ledState);
+                lastBlink = millis();
+            }
+        }
+        else
+        {
+            // Постоянное свечение при инициализации
+            digitalWrite(LED_PIN, HIGH);
+        }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
